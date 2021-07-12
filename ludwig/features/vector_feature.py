@@ -31,8 +31,9 @@ from ludwig.features.base_feature import InputFeature
 from ludwig.features.base_feature import OutputFeature
 from ludwig.modules.loss_modules import SoftmaxCrossEntropyLoss, MSELoss, \
     MAELoss
-from ludwig.modules.metric_modules import ErrorScore, \
+from ludwig.modules.metric_modules import (
     SoftmaxCrossEntropyMetric, MSEMetric, MAEMetric
+)
 from ludwig.modules.metric_modules import R2Score
 from ludwig.utils.misc_utils import set_default_value
 
@@ -43,12 +44,25 @@ class VectorFeatureMixin:
     type = VECTOR
     preprocessing_defaults = {
         'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': ""
+        'fill_value': '',
+    }
+
+    fill_value_schema = {
+        "type": "string",
+        "pattern": "^([0-9]+(\\.[0-9]*)?\\s*)*$"
+    }
+
+    preprocessing_schema = {
+        'vector_size': {'type': 'integer', 'minimum': 0},
+        'missing_value_strategy': {'type': 'string',
+                                   'enum': MISSING_VALUE_STRATEGY_OPTIONS},
+        'fill_value': fill_value_schema,
+        'computed_fill_value': fill_value_schema,
     }
 
     @staticmethod
-    def cast_column(feature, dataset_df, backend):
-        return dataset_df
+    def cast_column(column, backend):
+        return column
 
     @staticmethod
     def get_feature_meta(column, preprocessing_parameters, backend):
@@ -63,13 +77,14 @@ class VectorFeatureMixin:
             proc_df,
             metadata,
             preprocessing_parameters,
-            backend
+            backend,
+            skip_save_processed_input
     ):
         """
                 Expects all the vectors to be of the same size. The vectors need to be
                 whitespace delimited strings. Missing values are not handled.
                 """
-        if len(input_df) == 0:
+        if len(input_df[feature[COLUMN]]) == 0:
             raise ValueError("There are no vectors in the dataset provided")
 
         # Convert the string of features into a numpy array
@@ -86,7 +101,8 @@ class VectorFeatureMixin:
             raise
 
         # Determine vector size
-        vector_size = backend.df_engine.compute(proc_df[feature[PROC_COLUMN]].map(len).max())
+        vector_size = backend.df_engine.compute(
+            proc_df[feature[PROC_COLUMN]].map(len).max())
         if 'vector_size' in preprocessing_parameters:
             if vector_size != preprocessing_parameters['vector_size']:
                 raise ValueError(
@@ -213,7 +229,6 @@ class VectorOutputFeature(VectorFeatureMixin, OutputFeature):
     def _setup_metrics(self):
         self.metric_functions = {}  # needed to shadow class variable
         self.metric_functions[LOSS] = self.eval_loss_function
-        self.metric_functions[ERROR] = ErrorScore(name='metric_error')
         self.metric_functions[MEAN_SQUARED_ERROR] = MeanSquaredErrorMetric(
             name='metric_mse'
         )
@@ -221,6 +236,11 @@ class VectorOutputFeature(VectorFeatureMixin, OutputFeature):
             name='metric_mae'
         )
         self.metric_functions[R2] = R2Score(name='metric_r2')
+
+    def get_prediction_set(self):
+        return {
+            PREDICTIONS, LOGITS
+        }
 
     @classmethod
     def get_output_dtype(cls):
@@ -252,22 +272,15 @@ class VectorOutputFeature(VectorFeatureMixin, OutputFeature):
             result,
             metadata,
             output_directory,
-            skip_save_unprocessed_output=False,
+            backend,
     ):
-        postprocessed = {}
-        name = self.feature_name
-
-        npy_filename = os.path.join(output_directory, '{}_{}.npy')
-        if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            postprocessed[PREDICTIONS] = result[PREDICTIONS].numpy()
-            if not skip_save_unprocessed_output:
-                np.save(
-                    npy_filename.format(name, PREDICTIONS),
-                    postprocessed[PREDICTIONS]
-                )
-            del result[PREDICTIONS]
-
-        return postprocessed
+        predictions_col = f'{self.feature_name}_{PREDICTIONS}'
+        if predictions_col in result:
+            result[predictions_col] = backend.df_engine.map_objects(
+                result[predictions_col],
+                lambda pred: pred.tolist()
+            )
+        return result
 
     @staticmethod
     def populate_defaults(output_feature):

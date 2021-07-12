@@ -6,11 +6,9 @@ from ludwig.modules.activation_modules import glu
 from ludwig.modules.normalization_modules import GhostBatchNormalization
 
 
-# adapted and modified from https://github.com/ostamand/tensorflow-tabnet/blob/master/tabnet/models/model.py
 class TabNet(tf.keras.Model):
     def __init__(
             self,
-            num_features: int,
             size: int,
             output_size: int,
             num_steps: int = 1,
@@ -18,31 +16,35 @@ class TabNet(tf.keras.Model):
             num_shared_blocks: int = 2,
             relaxation_factor: float = 1.5,
             bn_momentum: float = 0.7,
-            bn_epsilon: float = 1e-5,
+            bn_epsilon: float = 1e-3,
             bn_virtual_bs: int = None,
             sparsity: float = 1e-5,
     ):
         """TabNet
         Will output a vector of size output_dim.
         Args:
-            num_features (int): Number of features.
             size (int): Embedding feature dimension to use.
             output_size (int): Output dimension.
             num_steps (int, optional): Total number of steps. Defaults to 1.
             num_total_blocks (int, optional): Total number of feature transformer blocks. Defaults to 4.
             num_shared_blocks (int, optional): Number of shared feature transformer blocks. Defaults to 2.
             relaxation_factor (float, optional): >1 will allow features to be used more than once. Defaults to 1.5.
-            bn_epsilon (float, optional): Batch normalization, epsilon. Defaults to 1e-5.
             bn_momentum (float, optional): Batch normalization, momentum. Defaults to 0.7.
+            bn_epsilon (float, optional): Batch normalization, epsilon. Defaults to 1e-5.
             bn_virtual_bs (int, optional): Virtual batch ize for ghost batch norm..
         """
         super().__init__()
-        self.num_features = num_features
         self.size = size
         self.output_size = output_size
         self.num_steps = num_steps
         self.relaxation_factor = relaxation_factor
         self.sparsity = sparsity
+
+        # needed by the attentive transformer in build()
+        self.num_steps = num_steps
+        self.bn_momentum = bn_momentum
+        self.bn_epsilon = bn_epsilon
+        self.bn_virtual_bs = bn_virtual_bs
 
         self.batch_norm = tf.keras.layers.BatchNormalization(
             momentum=bn_momentum, epsilon=bn_epsilon
@@ -57,7 +59,8 @@ class TabNet(tf.keras.Model):
             "bn_virtual_bs": bn_virtual_bs,
         }
 
-        # first feature transformer block is built first to get the shared blocks
+        # first feature transformer block is built first
+        # to get the shared blocks
         self.feature_transforms: List[FeatureTransformer] = [
             FeatureTransformer(**kargs)
         ]
@@ -70,21 +73,37 @@ class TabNet(tf.keras.Model):
                         0].shared_fc_layers
                 )
             )
-            self.attentive_transforms.append(
-                AttentiveTransformer(num_features, bn_momentum, bn_epsilon,
-                                     bn_virtual_bs)
-            )
+            # attentive transformers are initialized in build
+            # because their outputs size depends on the number
+            # of features that we determine by looking at the
+            # last dimension of the input tensor
+            # self.attentive_transforms.append(
+            #     AttentiveTransformer(num_features, bn_momentum, bn_epsilon,
+            #                          bn_virtual_bs)
+            # )
         self.final_projection = tf.keras.layers.Dense(self.output_size)
+
+    def build(self, input_shape):
+        num_features = input_shape[-1]
+        for i in range(self.num_steps):
+            self.attentive_transforms.append(
+                AttentiveTransformer(num_features, self.bn_momentum,
+                                     self.bn_epsilon, self.bn_virtual_bs)
+            )
 
     def call(
             self,
             features: tf.Tensor,
             training: bool = None,
             **kwargs
-    ) -> Tuple[tf.Tensor, List[tf.Tensor]]:
+    ) -> Tuple[tf.Tensor, tf.Tensor, List[tf.Tensor]]:
+        tf.assert_rank(features, 2)
+
         batch_size = tf.shape(features)[0]
+        num_features = tf.shape(features)[-1]
         out_accumulator = tf.zeros((batch_size, self.output_size))
-        prior_scales = tf.ones((batch_size, self.num_features))
+        aggregated_mask = tf.zeros([batch_size, num_features])
+        prior_scales = tf.ones((batch_size, num_features))
         masks = []
         total_entropy = 0.0
 
@@ -106,13 +125,11 @@ class TabNet(tf.keras.Model):
 
             # entropy is used to penalize the amount of sparsity
             # in feature selection
-            total_entropy = tf.reduce_mean(
+            total_entropy += tf.reduce_mean(
                 tf.reduce_sum(
-                    tf.multiply(mask_values,
-                                tf.math.log(mask_values + 1e-15)),
-                    axis=1,
-                )
-            )
+                    -mask_values * tf.math.log(mask_values + 0.00001),
+                    axis=1)
+            ) / self.num_steps
 
             masks.append(tf.expand_dims(tf.expand_dims(mask_values, 0), 3))
 
@@ -128,21 +145,27 @@ class TabNet(tf.keras.Model):
             out = tf.keras.activations.relu(x[:, :self.output_size])
             out_accumulator += out
 
+            # Aggregated masks are used for visualization of the
+            # feature importance attributes.
+            scale = tf.reduce_sum(out, axis=1, keepdims=True) / self.num_steps
+            aggregated_mask += mask_values * scale
+
         final_output = self.final_projection(out_accumulator)
 
-        self.add_loss(-self.sparsity * total_entropy / self.num_steps)
+        sparsity_loss = tf.multiply(self.sparsity, total_entropy)
+        setattr(sparsity_loss, "loss_name", "sparsity_loss")
+        self.add_loss(sparsity_loss)
 
-        return final_output, masks
+        return final_output, aggregated_mask, masks
 
 
-# adapted and modified from https://github.com/ostamand/tensorflow-tabnet/blob/master/tabnet/models/transformers.py
 class FeatureBlock(tf.keras.Model):
     def __init__(
             self,
             size: int,
             apply_glu: bool = True,
             bn_momentum: float = 0.9,
-            bn_epsilon: float = 1e-5,
+            bn_epsilon: float = 1e-3,
             bn_virtual_bs: int = None,
             shared_fc_layer: tf.keras.layers.Layer = None,
     ):
@@ -170,13 +193,12 @@ class FeatureBlock(tf.keras.Model):
         return hidden
 
 
-# adapted and modified from https://github.com/ostamand/tensorflow-tabnet/blob/master/tabnet/models/transformers.py
 class AttentiveTransformer(tf.keras.Model):
     def __init__(
             self,
             size: int,
             bn_momentum: float = 0.9,
-            bn_epsilon: float = 1e-5,
+            bn_epsilon: float = 1e-3,
             bn_virtual_bs: int = None,
     ):
         super().__init__()
@@ -192,6 +214,7 @@ class AttentiveTransformer(tf.keras.Model):
 
     def call(self, inputs, prior_scales, training=None, **kwargs):
         hidden = self.feature_block(inputs, training=training)
+        hidden = hidden * prior_scales
 
         # removing the mean to try to avoid numerical instability
         # https://github.com/tensorflow/addons/issues/2314
@@ -203,7 +226,7 @@ class AttentiveTransformer(tf.keras.Model):
         # to zero.
         # hidden = hidden - tf.math.reduce_mean(hidden, axis=1)[:, tf.newaxis]
 
-        hidden = hidden * prior_scales
+        # added to avoid NaNs in the sparsemax
         hidden = tf.clip_by_value(hidden,
                                   clip_value_min=-1.0e+6,
                                   clip_value_max=1.0e+6)
@@ -219,7 +242,7 @@ class FeatureTransformer(tf.keras.Model):
             num_total_blocks: int = 4,
             num_shared_blocks: int = 2,
             bn_momentum: float = 0.9,
-            bn_epsilon: float = 1e-5,
+            bn_epsilon: float = 1e-3,
             bn_virtual_bs: int = None,
     ):
         super().__init__()
@@ -252,8 +275,8 @@ class FeatureTransformer(tf.keras.Model):
     ) -> tf.Tensor:
         hidden = self.blocks[0](inputs, training=training)
         for n in range(1, self.num_total_blocks):
-            hidden = (hidden * tf.sqrt(0.5) +
-                      self.blocks[n](hidden, training=training))
+            hidden = (self.blocks[n](hidden, training=training) +
+                      hidden) * tf.sqrt(0.5)
         return hidden
 
     @property
